@@ -321,6 +321,66 @@ def get_device_action_string(action):
     return action_map.get(action, f"UNKNOWN_DEVICE_ACTION_{action}")
 
 
+def get_event_type_flags_string(events):
+    """Convert event type flags to a string of flag names"""
+    flag_map = {
+        pz.ZES_EVENT_TYPE_FLAG_DEVICE_DETACH: "DEVICE_DETACH",
+        pz.ZES_EVENT_TYPE_FLAG_DEVICE_ATTACH: "DEVICE_ATTACH",
+        pz.ZES_EVENT_TYPE_FLAG_DEVICE_SLEEP_STATE_ENTER: "DEVICE_SLEEP_STATE_ENTER",
+        pz.ZES_EVENT_TYPE_FLAG_DEVICE_SLEEP_STATE_EXIT: "DEVICE_SLEEP_STATE_EXIT",
+        pz.ZES_EVENT_TYPE_FLAG_FREQ_THROTTLED: "FREQ_THROTTLED",
+        pz.ZES_EVENT_TYPE_FLAG_ENERGY_THRESHOLD_CROSSED: "ENERGY_THRESHOLD_CROSSED",
+        pz.ZES_EVENT_TYPE_FLAG_TEMP_CRITICAL: "TEMP_CRITICAL",
+        pz.ZES_EVENT_TYPE_FLAG_TEMP_THRESHOLD1: "TEMP_THRESHOLD1",
+        pz.ZES_EVENT_TYPE_FLAG_TEMP_THRESHOLD2: "TEMP_THRESHOLD2",
+        pz.ZES_EVENT_TYPE_FLAG_MEM_HEALTH: "MEM_HEALTH",
+        pz.ZES_EVENT_TYPE_FLAG_FABRIC_PORT_HEALTH: "FABRIC_PORT_HEALTH",
+        pz.ZES_EVENT_TYPE_FLAG_PCI_LINK_HEALTH: "PCI_LINK_HEALTH",
+        pz.ZES_EVENT_TYPE_FLAG_RAS_CORRECTABLE_ERRORS: "RAS_CORRECTABLE_ERRORS",
+        pz.ZES_EVENT_TYPE_FLAG_RAS_UNCORRECTABLE_ERRORS: "RAS_UNCORRECTABLE_ERRORS",
+        pz.ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED: "DEVICE_RESET_REQUIRED",
+        pz.ZES_EVENT_TYPE_FLAG_SURVIVABILITY_MODE_DETECTED: "SURVIVABILITY_MODE_DETECTED",
+        pz.ZES_EVENT_TYPE_FLAG_INFO_LOG_CPER_DATA_AVAILABLE_EXT: "INFO_LOG_CPER_DATA_AVAILABLE_EXT",
+    }
+    if events == 0:
+        return "None"
+    names = [name for flag, name in flag_map.items() if events & flag]
+    return " | ".join(names) if names else f"UNKNOWN_EVENTS_{events:#x}"
+
+
+def get_reset_reason_flags_string(reasons):
+    """Convert reset reason flags to a string of flag names"""
+    flag_map = {
+        pz.ZES_RESET_REASON_FLAG_WEDGED: "WEDGED",
+        pz.ZES_RESET_REASON_FLAG_REPAIR: "REPAIR",
+    }
+    if reasons == 0:
+        return "None"
+    names = [name for flag, name in flag_map.items() if reasons & flag]
+    return " | ".join(names) if names else f"UNKNOWN_RESET_REASONS_{reasons:#x}"
+
+
+def get_repair_status_string(status):
+    """Convert repair status enum to string"""
+    status_map = {
+        pz.ZES_REPAIR_STATUS_UNSUPPORTED: "ZES_REPAIR_STATUS_UNSUPPORTED",
+        pz.ZES_REPAIR_STATUS_NOT_PERFORMED: "ZES_REPAIR_STATUS_NOT_PERFORMED",
+        pz.ZES_REPAIR_STATUS_PERFORMED: "ZES_REPAIR_STATUS_PERFORMED",
+    }
+    return status_map.get(status, f"UNKNOWN_REPAIR_STATUS_{status}")
+
+
+def get_health_status_string(health):
+    """Convert device health status enum to string"""
+    health_map = {
+        pz.ZES_DEVICE_HEALTH_STATUS_EXT_OK: "ZES_DEVICE_HEALTH_STATUS_EXT_OK",
+        pz.ZES_DEVICE_HEALTH_STATUS_EXT_WARNING: "ZES_DEVICE_HEALTH_STATUS_EXT_WARNING",
+        pz.ZES_DEVICE_HEALTH_STATUS_EXT_CRITICAL: "ZES_DEVICE_HEALTH_STATUS_EXT_CRITICAL",
+        pz.ZES_DEVICE_HEALTH_STATUS_EXT_FAILED: "ZES_DEVICE_HEALTH_STATUS_EXT_FAILED",
+    }
+    return health_map.get(health, f"UNKNOWN_HEALTH_STATUS_{health}")
+
+
 def is_root_user():
     """Return whether the current user has root privileges on platforms that support it"""
     geteuid = getattr(os, "geteuid", None)
@@ -836,6 +896,71 @@ def test_engine_modules(device_handle, device_index):
             print_verbose("      Activity:")
             print_verbose(f"        Active Time: {engineStats.activeTime}")
             print_verbose(f"        Timestamp: {engineStats.timestamp}")
+
+    return True
+
+
+def test_device_state_module(device_handle, device_index):
+    """Test device state, health status, event registration, and firmware enumeration"""
+    print(f"\n---- Device {device_index} Device State Test ----")
+
+    state = pz.zes_device_state_t()
+    state.stype = pz.ZES_STRUCTURE_TYPE_DEVICE_STATE
+    state.pNext = None
+
+    rc = pz.zesDeviceGetState(device_handle, byref(state))
+    if check_rc(f"zesDeviceGetState(device {device_index})", rc):
+        print_verbose("  State:")
+        print_verbose(
+            f"    Reset Reasons: {get_reset_reason_flags_string(state.reset)}"
+        )
+        print_verbose(f"    Repair Status: {get_repair_status_string(state.repaired)}")
+
+    # zesDeviceResetExt is not exercised here as a reset loses all device state
+    # and may kill applications using the device.
+
+    health = pz.zes_device_health_status_ext_t(0)
+    rc = pz.zesDeviceGetHealthStatusExt(device_handle, byref(health))
+    if rc != pz.ZE_RESULT_SUCCESS:
+        print_verbose(f"  Health Status: Not available ({get_result_string(rc)})")
+    else:
+        print_verbose(f"  Health Status: {get_health_status_string(health.value)}")
+
+        if is_root_user():
+            # Write back the health status just read so the device state is unchanged
+            rc = pz.zesDeviceSetHealthStatusExt(device_handle, health.value)
+            if check_rc(f"zesDeviceSetHealthStatusExt(device {device_index})", rc):
+                print_verbose("  Set health status successfully")
+        else:
+            print_verbose(
+                "  Skipping zesDeviceSetHealthStatusExt due to insufficient permissions"
+            )
+
+    events_to_register = pz.ZES_EVENT_TYPE_FLAG_DEVICE_RESET_REQUIRED
+    rc = pz.zesDeviceEventRegister(device_handle, events_to_register)
+    if rc != pz.ZE_RESULT_SUCCESS:
+        print_verbose(
+            f"  Device Event Registration: Not available ({get_result_string(rc)})"
+        )
+    else:
+        print_verbose(
+            f"  Registered device events: {get_event_type_flags_string(events_to_register)}"
+        )
+        # Clear the device event registration made by this test
+        rc = pz.zesDeviceEventRegister(device_handle, 0)
+        check_rc(f"zesDeviceEventRegister(device {device_index}, clear)", rc)
+
+    firmware_count = c_uint32(0)
+    rc = pz.zesDeviceEnumFirmwares(device_handle, byref(firmware_count), None)
+    if check_rc(f"zesDeviceEnumFirmwares(device {device_index}, count)", rc):
+        print_verbose(f"  Found {firmware_count.value} firmware component(s)")
+        if firmware_count.value > 0:
+            FirmwareArray = pz.zes_firmware_handle_t * firmware_count.value
+            firmware_handles = FirmwareArray()
+            rc = pz.zesDeviceEnumFirmwares(
+                device_handle, byref(firmware_count), firmware_handles
+            )
+            check_rc(f"zesDeviceEnumFirmwares(device {device_index}, handles)", rc)
 
     return True
 
@@ -1374,6 +1499,9 @@ def run_all_tests():
             # Test global device operations (properties and processes)
             test_global_operation(drivers[driver_idx], devices[device_idx], device_idx)
 
+            # Test device state, health, events, and firmware enumeration
+            test_device_state_module(devices[device_idx], device_idx)
+
             # Test PCI module
             test_pci_module(devices[device_idx], device_idx)
 
@@ -1406,7 +1534,7 @@ def main():
         epilog="""Examples:
   %(prog)s -a                 # Run all tests
   %(prog)s -m                 # Memory tests only
-  %(prog)s -g                 # Global operations (device properties and processes) only
+  %(prog)s -g                 # Global operations (device properties, processes, and state) only
   %(prog)s -p                 # PCI tests only
   %(prog)s -C                 # ECC tests only
   %(prog)s -o                 # Power tests only
@@ -1425,7 +1553,7 @@ def main():
         "-g",
         "--global",
         action="store_true",
-        help="Run only global operations (device properties and processes)",
+        help="Run only global operations (device properties, processes, and state)",
     )
     parser.add_argument(
         "-o", "--power", action="store_true", help="Run only power-related tests"
@@ -1493,6 +1621,7 @@ def main():
             for device_idx in range(device_count):
                 if getattr(args, "global", False):
                     test_global_operation(drivers[0], devices[device_idx], device_idx)
+                    test_device_state_module(devices[device_idx], device_idx)
 
                 if args.pci:
                     test_pci_module(devices[device_idx], device_idx)
