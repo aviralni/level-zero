@@ -321,6 +321,36 @@ def get_device_action_string(action):
     return action_map.get(action, f"UNKNOWN_DEVICE_ACTION_{action}")
 
 
+def get_info_log_type_string(info_log_type):
+    """Convert info log type enum to string"""
+    type_map = {
+        pz.ZES_INFO_LOG_TYPE_EXT_DEVICE: "ZES_INFO_LOG_TYPE_EXT_DEVICE",
+    }
+    return type_map.get(info_log_type, f"UNKNOWN_INFO_LOG_TYPE_{info_log_type}")
+
+
+def get_info_log_format_string(info_log_format):
+    """Convert info log format enum to string"""
+    format_map = {
+        pz.ZES_INFO_LOG_FORMAT_EXT_CPER: "ZES_INFO_LOG_FORMAT_EXT_CPER",
+    }
+    return format_map.get(info_log_format, f"UNKNOWN_INFO_LOG_FORMAT_{info_log_format}")
+
+
+def get_info_log_record_type_string(record_type):
+    """Convert info log record type enum to string"""
+    record_type_map = {
+        pz.ZES_INFO_LOG_RECORD_TYPE_EXT_UNKNOWN: "ZES_INFO_LOG_RECORD_TYPE_EXT_UNKNOWN",
+        pz.ZES_INFO_LOG_RECORD_TYPE_EXT_INFORMATIONAL: "ZES_INFO_LOG_RECORD_TYPE_EXT_INFORMATIONAL",
+        pz.ZES_INFO_LOG_RECORD_TYPE_EXT_ERROR_CORRECTED: "ZES_INFO_LOG_RECORD_TYPE_EXT_ERROR_CORRECTED",
+        pz.ZES_INFO_LOG_RECORD_TYPE_EXT_ERROR_RECOVERABLE: "ZES_INFO_LOG_RECORD_TYPE_EXT_ERROR_RECOVERABLE",
+        pz.ZES_INFO_LOG_RECORD_TYPE_EXT_ERROR_FATAL: "ZES_INFO_LOG_RECORD_TYPE_EXT_ERROR_FATAL",
+    }
+    return record_type_map.get(
+        record_type, f"UNKNOWN_INFO_LOG_RECORD_TYPE_{record_type}"
+    )
+
+
 def is_root_user():
     """Return whether the current user has root privileges on platforms that support it"""
     geteuid = getattr(os, "geteuid", None)
@@ -838,6 +868,162 @@ def test_engine_modules(device_handle, device_index):
             print_verbose(f"        Timestamp: {engineStats.timestamp}")
 
     return True
+
+
+INFO_LOG_READ_TIMEOUT_MS = 1000
+
+
+def test_info_log_module(driver_handle, driver_index):
+    """Test info log enumeration, properties, and collection instance operations"""
+    print(f"\n---- Driver {driver_index} Info Log Test ----")
+
+    info_log_count = c_uint32(0)
+    rc = pz.zesDriverEnumInfoLogsExt(driver_handle, byref(info_log_count), None)
+    if not check_rc(f"zesDriverEnumInfoLogsExt(driver {driver_index}, count)", rc):
+        return False
+
+    if info_log_count.value == 0:
+        print_verbose("No info logs found on this driver")
+        return True
+
+    print_verbose(f"Found {info_log_count.value} info log(s)")
+
+    InfoLogArray = pz.zes_info_log_handle_t * info_log_count.value
+    info_log_handles = InfoLogArray()
+
+    rc = pz.zesDriverEnumInfoLogsExt(
+        driver_handle, byref(info_log_count), info_log_handles
+    )
+    if not check_rc(f"zesDriverEnumInfoLogsExt(driver {driver_index}, handles)", rc):
+        return False
+
+    for i in range(info_log_count.value):
+        print_verbose(f"\n  Info Log {i}:")
+
+        props = pz.zes_info_log_ext_properties_t()
+        props.stype = pz.ZES_STRUCTURE_TYPE_INFO_LOG_EXT_PROPERTIES
+        props.pNext = None
+
+        rc = pz.zesInfoLogGetPropertiesExt(info_log_handles[i], byref(props))
+        if not check_rc(f"zesInfoLogGetPropertiesExt(info log {i})", rc):
+            continue
+
+        print_verbose(f"    Type: {get_info_log_type_string(props.infoLogType)}")
+        print_verbose(f"    Format: {get_info_log_format_string(props.infoLogFormat)}")
+        print_verbose(
+            f"    Named Instance Supported: {bool(props.isNamedInstanceSupported)}"
+        )
+        print_verbose(f"    Peek Data Supported: {bool(props.isPeekDataSupported)}")
+
+        # Use the default buffer and default buffer size
+        desc = pz.zes_info_log_instance_ext_desc_t()
+        desc.stype = pz.ZES_STRUCTURE_TYPE_INFO_LOG_INSTANCE_EXT_DESC
+        desc.pNext = None
+        desc.pBufferSizeInKb = None
+
+        instance_handle = pz.zes_info_log_instance_handle_t()
+        rc = pz.zesInfoLogCreateInstanceExt(
+            info_log_handles[i], None, byref(desc), byref(instance_handle)
+        )
+        if rc != pz.ZE_RESULT_SUCCESS:
+            print_verbose(
+                f"    Collection Instance: Not available ({get_result_string(rc)})"
+            )
+            continue
+
+        print_verbose("    Created collection instance successfully")
+
+        # Only a query call is made, so records in the shared default buffer are not consumed
+        size = c_uint32(0)
+        record_count = c_uint32(0)
+        rc = pz.zesInfoLogInstanceReadWithMetadataExt(
+            instance_handle,
+            INFO_LOG_READ_TIMEOUT_MS,
+            byref(size),
+            None,
+            byref(record_count),
+            None,
+            None,
+        )
+        if check_rc(f"zesInfoLogInstanceReadWithMetadataExt(info log {i}, query)", rc):
+            print_verbose(
+                f"    Read Query: {record_count.value} record(s), {size.value} bytes"
+            )
+
+        if props.isPeekDataSupported:
+            test_info_log_peek(instance_handle, i)
+
+        rc = pz.zesInfoLogInstanceDeleteExt(instance_handle)
+        if check_rc(f"zesInfoLogInstanceDeleteExt(info log {i})", rc):
+            print_verbose("    Deleted collection instance successfully")
+
+    return True
+
+
+def test_info_log_peek(instance_handle, info_log_index):
+    """Peek at the records held by an info log collection instance without consuming them"""
+    size = c_uint32(0)
+    record_count = c_uint32(0)
+    rc = pz.zesInfoLogInstancePeekWithMetadataExt(
+        instance_handle,
+        INFO_LOG_READ_TIMEOUT_MS,
+        byref(size),
+        None,
+        byref(record_count),
+        None,
+        None,
+    )
+    if not check_rc(
+        f"zesInfoLogInstancePeekWithMetadataExt(info log {info_log_index}, query)", rc
+    ):
+        return
+
+    print_verbose(f"    Peek Query: {record_count.value} record(s), {size.value} bytes")
+    if size.value == 0 or record_count.value == 0:
+        return
+
+    buffer = (c_uint8 * size.value)()
+    descriptors = (pz.zes_info_log_metadata_ext_t * record_count.value)()
+    for j in range(record_count.value):
+        descriptors[j].stype = pz.ZES_STRUCTURE_TYPE_INFO_LOG_METADATA_EXT
+        descriptors[j].pNext = None
+
+    status = pz.zes_info_log_read_status_ext_t()
+    status.stype = pz.ZES_STRUCTURE_TYPE_INFO_LOG_READ_STATUS_EXT
+    status.pNext = None
+
+    rc = pz.zesInfoLogInstancePeekWithMetadataExt(
+        instance_handle,
+        INFO_LOG_READ_TIMEOUT_MS,
+        byref(size),
+        buffer,
+        byref(record_count),
+        descriptors,
+        byref(status),
+    )
+    if rc == pz.ZE_RESULT_WARNING_DROPPED_DATA:
+        print_verbose(f"    Dropped Records: {status.droppedRecordCount}")
+    elif not check_rc(
+        f"zesInfoLogInstancePeekWithMetadataExt(info log {info_log_index}, data)", rc
+    ):
+        return
+
+    print_verbose(f"    Peeked {record_count.value} record(s), {size.value} bytes:")
+    for j in range(record_count.value):
+        record = descriptors[j]
+        print_verbose(f"      Record {j}:")
+        print_verbose(
+            f"        Type: {get_info_log_record_type_string(record.recordType)}"
+        )
+        print_verbose(
+            f"        BDF: {record.address.domain:04X}:{record.address.bus:02X}:"
+            f"{record.address.device:02X}.{record.address.function:X}"
+        )
+        print_verbose(f"        Timestamp: {record.timestamp} ns")
+        print_verbose(f"        Offset: {record.offset}")
+        print_verbose(f"        Length: {record.lengthOfData} bytes")
+    print_verbose(f"    Consumed Data Size: {status.consumedDataSize} bytes")
+    print_verbose(f"    Has Data To Read: {bool(status.hasDataToRead)}")
 
 
 def test_memory_modules(device_handle, device_index):
@@ -1395,6 +1581,9 @@ def run_all_tests():
             # Test engine modules
             test_engine_modules(devices[device_idx], device_idx)
 
+        # Test info logs (driver scoped)
+        test_info_log_module(drivers[driver_idx], driver_idx)
+
     print("\n=== Test Completed ===")
     return True
 
@@ -1413,6 +1602,7 @@ def main():
   %(prog)s -f                 # Frequency tests only
   %(prog)s -t                 # Temperature tests only
   %(prog)s -e                 # Engine tests only
+  %(prog)s -l                 # Info log tests only
   %(prog)s -h                 # Show help message""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1450,6 +1640,9 @@ def main():
         version="Python Level Zero Sysman Black Box Test v1.0",
     )
     parser.add_argument("-e", "--engine", action="store_true", help="Run engine tests ")
+    parser.add_argument(
+        "-l", "--infolog", action="store_true", help="Run only info log tests"
+    )
 
     args = parser.parse_args()
 
@@ -1463,6 +1656,7 @@ def main():
         or args.frequency
         or args.temperature
         or args.engine
+        or args.infolog
         or args.all
     )
 
@@ -1488,6 +1682,11 @@ def main():
             if not devices or device_count == 0:
                 print("No devices available for testing")
                 return 1
+
+            # Info logs are driver scoped, so run them once per driver
+            if args.infolog:
+                for driver_idx in range(driver_count):
+                    test_info_log_module(drivers[driver_idx], driver_idx)
 
             # Run selected tests on all devices
             for device_idx in range(device_count):
